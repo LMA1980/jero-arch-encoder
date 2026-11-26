@@ -21,7 +21,7 @@ use crate::weights::{
     embed_encoder_sequence, ffn_down_candidates, ffn_gate_candidates, ffn_norm_candidates,
     ffn_up_candidates, find_tensor_desc, infer_linear_out_dim, infer_num_labels_from_metadata,
     maybe_finalize_embedding_output, project_classifier_logits_strict, resolve_optional_bias,
-    resolve_optional_tensor, resolve_required_norm, resolve_required_tensor,
+    resolve_optional_norm, resolve_optional_tensor, resolve_required_norm, resolve_required_tensor,
 };
 
 /// Feed-forward non-linearity used by bidirectional encoder blocks.
@@ -396,23 +396,32 @@ impl ModernBertRecipe {
         let mut attn_out_buf = vec![0.0_f32; seq_len * attn_dim];
         let mut norm_tok = vec![0.0_f32; hidden_dim];
 
-        let (attn_norm_w, attn_norm_b) = resolve_required_norm(
-            weights,
-            &attn_norm_candidates(layer),
-            &format!("blk.{layer}.attn_norm.weight"),
-            hidden_dim,
-        )?;
+        let attn_norm =
+            if matches!(self.architecture, "modernbert" | "modernbert-reranker") && layer == 0 {
+                resolve_optional_norm(weights, &attn_norm_candidates(layer), hidden_dim)?
+            } else {
+                Some(resolve_required_norm(
+                    weights,
+                    &attn_norm_candidates(layer),
+                    &format!("blk.{layer}.attn_norm.weight"),
+                    hidden_dim,
+                )?)
+            };
         let qkv_weights = resolve_layer_qkv_weights(weights, layer, attn_dim)?;
 
         for pos in 0..seq_len {
             let tok_in = &seq_hidden[pos * hidden_dim..(pos + 1) * hidden_dim];
-            layernorm_compat(
-                &mut norm_tok,
-                tok_in,
-                &attn_norm_w,
-                attn_norm_b.as_deref(),
-                self.norm_eps,
-            )?;
+            if let Some((attn_norm_w, attn_norm_b)) = &attn_norm {
+                layernorm_compat(
+                    &mut norm_tok,
+                    tok_in,
+                    attn_norm_w,
+                    attn_norm_b.as_deref(),
+                    self.norm_eps,
+                )?;
+            } else {
+                norm_tok.copy_from_slice(tok_in);
+            }
 
             let dst = pos * attn_dim..(pos + 1) * attn_dim;
             project_qkv_token(
@@ -1402,5 +1411,119 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn build_hf_modernbert_safetensors(include_layer1_attn_norm: bool) -> Vec<u8> {
+        use super::test_fixtures::{deterministic_f32_bytes, norm_ones_f32_bytes};
+        use jero_core::safetensors::test_helpers::create_synthetic_safetensors;
+
+        let (num_layers, vocab_size, hidden_dim, ffn_dim) = (2_usize, 16_usize, 8_usize, 16_usize);
+        let mut payloads: Vec<(String, Vec<usize>, Vec<u8>)> = vec![
+            (
+                "model.embeddings.tok_embeddings.weight".to_owned(),
+                vec![vocab_size, hidden_dim],
+                deterministic_f32_bytes(vocab_size * hidden_dim, 1),
+            ),
+            (
+                "model.embeddings.norm.weight".to_owned(),
+                vec![hidden_dim],
+                norm_ones_f32_bytes(hidden_dim),
+            ),
+            (
+                "model.final_norm.weight".to_owned(),
+                vec![hidden_dim],
+                norm_ones_f32_bytes(hidden_dim),
+            ),
+        ];
+        let mut seed = 2_usize;
+        for l in 0..num_layers {
+            // HF ModernBERT-base omits layer 0 attn_norm (identity after embeddings.norm).
+            if l > 0 && include_layer1_attn_norm {
+                payloads.push((
+                    format!("model.layers.{l}.attn_norm.weight"),
+                    vec![hidden_dim],
+                    norm_ones_f32_bytes(hidden_dim),
+                ));
+                seed += 1;
+            }
+            payloads.push((
+                format!("model.layers.{l}.attn.Wqkv.weight"),
+                vec![hidden_dim * 3, hidden_dim],
+                deterministic_f32_bytes(hidden_dim * 3 * hidden_dim, seed),
+            ));
+            seed += 1;
+            payloads.push((
+                format!("model.layers.{l}.attn.Wo.weight"),
+                vec![hidden_dim, hidden_dim],
+                deterministic_f32_bytes(hidden_dim * hidden_dim, seed),
+            ));
+            seed += 1;
+            payloads.push((
+                format!("model.layers.{l}.mlp_norm.weight"),
+                vec![hidden_dim],
+                norm_ones_f32_bytes(hidden_dim),
+            ));
+            seed += 1;
+            payloads.push((
+                format!("model.layers.{l}.mlp.Wi.weight"),
+                vec![ffn_dim * 2, hidden_dim],
+                deterministic_f32_bytes(ffn_dim * 2 * hidden_dim, seed),
+            ));
+            seed += 1;
+            payloads.push((
+                format!("model.layers.{l}.mlp.Wo.weight"),
+                vec![hidden_dim, ffn_dim],
+                deterministic_f32_bytes(hidden_dim * ffn_dim, seed),
+            ));
+            seed += 1;
+        }
+        let meta = [
+            ("general.architecture", "modernbert"),
+            ("num_hidden_layers", "2"),
+            ("hidden_size", "8"),
+            ("intermediate_size", "16"),
+            ("num_attention_heads", "2"),
+        ];
+        let borrowed: Vec<(&str, QuantType, &[usize], &[u8])> = payloads
+            .iter()
+            .map(|(n, s, b)| (n.as_str(), QuantType::F32, s.as_slice(), b.as_slice()))
+            .collect();
+        create_synthetic_safetensors(&meta, &borrowed)
+    }
+
+    #[test]
+    fn test_hf_modernbert_safetensors_layout_and_layer1_fail_closed() {
+        let bytes_ok = build_hf_modernbert_safetensors(true);
+        let st_ok = SafeTensorsFile::parse(&bytes_ok).expect("parse hf modernbert st");
+        let recipe =
+            ModernBertRecipe::from_metadata("modernbert", Some(st_ok.metadata())).expect("recipe");
+        assert_eq!(recipe.num_layers, 2);
+        assert_eq!(recipe.hidden_dim, 8);
+        assert_eq!(recipe.ffn_dim, 16);
+        assert_eq!(recipe.n_heads, 2);
+
+        let mut embed_out = [0.0_f32; 8];
+        let mut ctx = ExecutionContext::new(&[1_u32, 3, 5], 64, &mut [], &mut [])
+            .expect("ctx")
+            .with_embedding_output(&mut embed_out, EmbeddingPooling::Mean, None)
+            .expect("attach embed");
+        recipe
+            .forward_classify(&mut ctx, &st_ok)
+            .expect("HF ModernBERT SafeTensors layout with omitted layer-0 attn_norm succeeds");
+        let norm_sq: f32 = embed_out.iter().map(|v| v * v).sum();
+        assert!((norm_sq - 1.0).abs() < 1e-4);
+
+        // Layer > 0 missing attn_norm must still fail closed.
+        let bytes_missing_l1 = build_hf_modernbert_safetensors(false);
+        let st_missing_l1 = SafeTensorsFile::parse(&bytes_missing_l1).expect("parse incomplete st");
+        let mut embed_err = [0.0_f32; 8];
+        let mut ctx_err = ExecutionContext::new(&[1_u32, 3, 5], 64, &mut [], &mut [])
+            .expect("ctx err")
+            .with_embedding_output(&mut embed_err, EmbeddingPooling::Mean, None)
+            .expect("attach embed err");
+        let err = recipe
+            .forward_classify(&mut ctx_err, &st_missing_l1)
+            .expect_err("layer 1 missing attn_norm must fail closed");
+        assert!(matches!(err, K3Error::TensorBoundsError { .. }));
     }
 }

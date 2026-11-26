@@ -102,18 +102,40 @@ pub(crate) fn resolve_optional_bias(
     Ok(Some(bias))
 }
 
+pub(crate) type NormPair = (Vec<f32>, Option<Vec<f32>>);
+
+fn decode_norm_pair(
+    weights: &dyn ModelWeights,
+    view: &TensorView<'_>,
+    len: usize,
+) -> Result<NormPair, K3Error> {
+    let mut weight = vec![0.0_f32; len];
+    decode_norm_weights(view, &mut weight)?;
+    let bias = resolve_optional_bias(weights, view.name(), &[], len)?;
+    Ok((weight, bias))
+}
+
 /// Resolves a required 1D normalization weight tensor (and optional matching bias).
 pub(crate) fn resolve_required_norm(
     weights: &dyn ModelWeights,
     candidates: &[String],
     canonical_name: &str,
     len: usize,
-) -> Result<(Vec<f32>, Option<Vec<f32>>), K3Error> {
+) -> Result<NormPair, K3Error> {
     let view = resolve_required_tensor(weights, candidates, canonical_name)?;
-    let mut weight = vec![0.0_f32; len];
-    decode_norm_weights(&view, &mut weight)?;
-    let bias = resolve_optional_bias(weights, view.name(), &[], len)?;
-    Ok((weight, bias))
+    decode_norm_pair(weights, &view, len)
+}
+
+/// Resolves an optional 1D normalization weight tensor (and optional matching bias).
+pub(crate) fn resolve_optional_norm(
+    weights: &dyn ModelWeights,
+    candidates: &[String],
+    len: usize,
+) -> Result<Option<NormPair>, K3Error> {
+    let Some(view) = resolve_optional_tensor(weights, candidates)? else {
+        return Ok(None);
+    };
+    decode_norm_pair(weights, &view, len).map(Some)
 }
 
 /// Adds an optional bias vector element-wise to `dst`, checking exact length.
@@ -227,6 +249,7 @@ pub(crate) fn ffn_norm_candidates(layer: usize) -> Vec<String> {
         format!("deberta.encoder.layer.{layer}.output.LayerNorm.weight"),
         format!("roberta.encoder.layer.{layer}.output.LayerNorm.weight"),
         format!("model.layers.{layer}.ffn_norm.weight"),
+        format!("model.layers.{layer}.mlp_norm.weight"),
         format!("model.layers.{layer}.post_attention_layernorm.weight"),
         format!("encoder.layers.{layer}.norm2.weight"),
         format!("layers.{layer}.ffn_norm.weight"),
@@ -344,6 +367,7 @@ pub(crate) fn final_norm_candidates() -> Vec<String> {
         "final_norm.weight",
         "output_norm.weight",
         "model.norm.weight",
+        "model.final_norm.weight",
         "norm.weight",
         "encoder.layer_norm.weight",
         "final_layer_norm.weight",
